@@ -365,15 +365,22 @@ namespace WorkflowCore.Services.DefinitionStorage
 
             void acn(IStepBody pStep, object pData, IStepExecutionContext pContext)
             {
-                object resolvedValue = sourceExpr.Compile().DynamicInvoke(pData, pContext, Environment.GetEnvironmentVariables());
-                if (stepProperty.PropertyType.IsEnum)
-                    stepProperty.SetValue(pStep, Enum.Parse(stepProperty.PropertyType, (string)resolvedValue, true));
+                var resolvedValue = sourceExpr.Compile().DynamicInvoke(pData, pContext, Environment.GetEnvironmentVariables());
+                if ((resolvedValue != null) &&
+                    (stepProperty.PropertyType.IsAssignableFrom(resolvedValue.GetType())))
+                {
+                    stepProperty.SetValue(pStep, resolvedValue);
+                }
+                else if (resolvedValue != null &&
+                         stepProperty.PropertyType
+                             .GetInterfaces()
+                             .Any(i => (i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEnumerable<>)) || (!i.IsGenericType && i.IsAssignableFrom(typeof(IEnumerable)))))
+                {
+                    stepProperty.SetValue(pStep, ConvertList(stepProperty.PropertyType, resolvedValue));
+                }
                 else
                 {
-                    if ((resolvedValue != null) && (stepProperty.PropertyType.IsAssignableFrom(resolvedValue.GetType())))
-                        stepProperty.SetValue(pStep, resolvedValue);
-                    else
-                        stepProperty.SetValue(pStep, System.Convert.ChangeType(resolvedValue, stepProperty.PropertyType));
+                    stepProperty.SetValue(pStep, ConvertValue(stepProperty.PropertyType, resolvedValue));
                 }
             }
             return acn;
@@ -410,5 +417,61 @@ namespace WorkflowCore.Services.DefinitionStorage
             return acn;
         }
 
+        private static object ConvertList(Type type, object value)
+        {
+            if (!CheckArgumentsMatch(type, value))
+            {
+                throw new InvalidOperationException();
+            }
+
+            var arguments = type.GetGenericArguments();
+
+            if (type.IsArray)
+            {
+                var elementType = type.GetElementType();
+
+                var array = Array.CreateInstance(elementType, (value as IEnumerable<object>).Count());
+
+                var i = 0;
+                foreach (var o in value as IEnumerable)
+                {
+                    array.SetValue(ConvertValue(elementType, o), i++);
+                }
+
+                return array;
+            }
+
+            if (!type.IsClass)
+            {
+                var genericListType = typeof(List<>);
+                type = genericListType.MakeGenericType(arguments[0]);
+            }
+
+            var list = Activator.CreateInstance(type);
+            var add = type.GetMethod(nameof(IList.Add), new[] { arguments[0] });
+            foreach (var o in value as IEnumerable)
+            {
+                add?.Invoke(list, new[] { ConvertValue(arguments[0], o) });
+            }
+
+            return list;
+        }
+
+        private static object ConvertValue(Type type, object value)
+        {
+            return type.IsEnum && value is string stringValue
+                ? Enum.Parse(type, stringValue, true)
+                : System.Convert.ChangeType(value, type);
+        }
+
+        private static bool CheckArgumentsMatch(Type type, object value)
+        {
+            var arguments = type.GetGenericArguments();
+            var argumentsToCheck = value.GetType().GetGenericArguments();
+
+            if ((arguments.FirstOrDefault()?.IsEnum ?? false) && (argumentsToCheck.FirstOrDefault()?.IsAssignableFrom(typeof(string)) ?? false)) return true;
+
+            return arguments.Zip(argumentsToCheck, (t1, t2) => t1.IsAssignableFrom(t2)).All(a => a);
+        }
     }
 }
